@@ -1,0 +1,380 @@
+
+static NV_STATUS uvm_hmm_migrate_begin(uvm_va_block_t *va_block)
+{
+    return NV_OK;
+}	
+```
+
+可以看到在NV的源码中uvm\_hmm\_migrate\_begin函数看起来像是那个进行页面迁移的函数，可惜这里隐藏了实现直接返回了OK。也许我们可以从源码中的一段注释找到一些线索
+
+```c
+/*
+Note that normally we should find a va_block for the faulting address because the block had to be created when migrating a page to the GPU and a device private PTE inserted into the CPU page tables in order for migrate_to_ram() to be called. Not finding it means the PTE was remapped to a different virtual address with mremap() so create a new va_block if needed.
+*/
+```
+
+## Ascend的实现
+
+华为昇腾Ascend的SDK中也包含了UM相关的内容，源码是开放的更加有助于我们理解UM的实现方式。Ascend的SVM（Shared Virtual Memory共享虚拟内存）模块，负责管理device在主机侧的虚拟地址映射，函数DVresult drvMemAllocPhy32PageManaged(DVdevice device, DVdeviceptr \*pp, size\_t bytesize)底层会调用SVM的mmap系统调用并配置相应的缺页中断处理函数，之后在缺页中断中完成页的迁移。
+
+```c
+STATIC int devmm_svm_mmap(struct file *file, struct vm_area_struct *vma)
+{
+    /*省略部分代码*/
+    vma->vm_flags |= VM_DONTEXPAND | VM_DONTDUMP | VM_DONTCOPY | VM_PFNMAP | VM_LOCKED | VM_WRITE;
+    devmm_svm_setup_vma_ops(vma);
+    /*省略部分代码*/
+    return 0;
+}
+
+static struct vm_operations_struct svm_master_vma_ops = {
+    .open = devmm_vm_open,
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 11, 0)
+    .fault = devmm_svm_vmf_fault_host,
+#else
+    .fault = devmm_svm_vm_fault_host,
+#endif
+};
+```
+
+当上层调用drvMemAllocPhy32PageManaged申请内存时，通过mmap系统调用内核会返回给用户层对应大小的虚拟地址空间。drvMemAllocPhy32PageManaged函数的简略实现可描述为(该函数实现的源码是闭源，以下代码是作者自己猜的)。
+
+```c
+int drvMemAllocPhy32PageManaged(void **devptr， size_t size)
+{
+    void *addr;
+    int fd = open("/dev/duca0", O_RDWR);
+    if(fd >= 0) {
+        addr = mmap(NULL, size, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0)
+    }
+    *devptr = addr;
+}
+```
+
+主机调用mmap系统调用后，内核会依次运行
+sys_mmap_pgoffsys
+get_unmapped_area()
+mmap_region
+file->fop->mmap()
+devmm_svm_mmap
+最终配置vma的函数操作集为svm_master_vma_ops。在这个过程中虚拟地址空间的申请由内核自动完成，剩下要做的就是在缺页中断处理函数中申请物理内存建立映射关系。
+
+当主机通过该API申请到内存后，如果去访问这个虚拟地址则会触发缺页中断，缺页中断会调用mmap中配置的svm\_master\_vma\_ops中的devmm\_svm\_vmf\_fault\_host函数。该函数的实现如下(已省略大量与主题无关的代码)
+
+```c
+STATIC int devmm_svm_vm_fault_host_proc(struct devmm_svm_process *svm_proc,
+    struct vm_area_struct *vma, struct vm_fault *vmf)
+{
+    u64 start = vma->vm_start + (vmf->pgoff << PAGE_SHIFT);
+    struct page_map_info page_map_info = {0};
+    struct devmm_devid svm_id = {0};
+    struct page **pages = NULL;
+    unsigned int adjust_order;
+    u32 dev_id, phy_id, vfid;
+    u64 page_num;
+    int ret;
+
+    page_num = 1ull << adjust_order;
+    pages = kzalloc(sizeof(struct page *) * page_num, GFP_KERNEL);
+    if (pages == NULL) {
+        devmm_drv_err("Kzalloc failed. (adjust_order=%u; start=0x%llx)\n", adjust_order, start);
+        ret = DEVMM_FAULT_ERROR;
+        goto devmm_svm_vm_fault_host_out;
+    }
+
+    page_map_info.nid = NUMA_NO_NODE;
+    page_map_info.page_num = page_num;
+    page_map_info.inpages = pages;
+    ret = devmm_alloc_pages(&page_map_info, svm_proc);  /*申请物理内存*/
+    if (ret) {
+        devmm_drv_err("Devmm_alloc_pages error. (ret=%d; start=0x%llx; adjust_order=%u)\n",
+                      ret, start, adjust_order);
+        ret = DEVMM_FAULT_ERROR;
+        goto devmm_svm_vm_fault_host_free_page;
+    }
+    /* dev_id: DEVMM_MAX_DEVICE_NUM means unmap in host and dev */
+    dev_id = devmm_svm_va_to_devid(svm_proc, start);
+    if (dev_id < DEVMM_MAX_DEVICE_NUM) {
+        phy_id = devmm_get_phyid_devid_from_svm_process(svm_proc, dev_id);
+        vfid = devmm_get_vfid_from_svm_process(svm_proc, dev_id);
+        (void)devmm_fill_svm_id(&svm_id, dev_id, phy_id, vfid);
+        devmm_free_pages_cache(svm_proc, dev_id, 1, heap->chunk_page_size, start, true);
+        ret = devmm_page_fault_h2d_sync(svm_id, pages, start, adjust_order, heap); /*发送页信息到device*/
+        if (ret) {
+            devmm_drv_err("Devmm_page_fault_h2d_sync error. (ret=%d; dev_id=%u)\n", ret, dev_id);
+            ret = DEVMM_FAULT_ERROR;
+            devmm_free_pages(page_num, pages, svm_proc);
+            goto devmm_svm_vm_fault_host_free_page;
+        }
+        devmm_svm_free_share_page_msg(svm_proc, heap, start, heap->chunk_page_size, page_bitmap);
+        devmm_svm_clear_mapped_with_heap(svm_proc, start, heap->chunk_page_size, dev_id, heap);
+    } else if (devmm_is_host_agent(dev_id)) {
+        /* host agent not surport page fault */
+        devmm_drv_err("Dev_id is error. (dev_id=%u)\n", dev_id);
+        ret = DEVMM_FAULT_ERROR;
+        devmm_free_pages(page_num, pages, svm_proc);
+        goto devmm_svm_vm_fault_host_free_page;
+    }
+
+    ret = devmm_pages_remap(svm_proc, start, 1ULL << adjust_order, pages); /*建立映射*/
+    if (ret) {
+        devmm_drv_err("Insert pages vma error. (ret=%d; start=0x%llx; adjust_order=%u)\n",
+                      ret, start, adjust_order);
+        ret = DEVMM_FAULT_ERROR;
+        devmm_free_pages(page_num, pages, svm_proc);
+        goto devmm_svm_vm_fault_host_free_page;
+    }
+
+    ret = DEVMM_FAULT_OK;
+
+devmm_svm_vm_fault_host_free_page:
+    kfree(pages);
+    pages = NULL;
+
+devmm_svm_vm_fault_host_out:
+    up_write(&svm_proc->host_fault_sem);
+    devmm_drv_debug("Exit host vm fault. (ret=%d)\n", ret);
+    return ret;
+
+```
+
+详细分析该函数的实现
+
+*   devmm\_alloc\_pages函数会在主机端申请物理页。在不使用大页或者巨页的情况下，每次缺页中断会申请一个页，devmm\_alloc\_pages最终会调用numa的page申请接口alloc\_pages\_node申请物理内存。
+*   devmm\_page\_fault\_h2d\_sync会将申请到的页信息发送到device，device会使用得到的页面信息做dma拷贝
+*   devmm\_pages\_remap会调用remap\_pfn\_range函数为申请到的物理地址建立页表并将vma插入自己的进程空间中。同时会调用get\_page函数锁住这个页面
+
+函数devmm\_page\_fault\_h2d\_sync的注释和实现详细描述了主机端的缺页流程
+
+```c
+/* h2d fault, inv device pagetable: (the max dma unit size is PAGESIZE ?)
+ * 1. host host query host page (pin page and map dma)
+ * 2. host send page-msg to device
+ * 3. device recv and prs devic pagetable
+ * 4. device query device page
+ * 5. device copy to host
+ * 6. device inv device page,return.
+ * 7. host (unpin page and unmap dma) if non full size, return to 1.
+ */
+int devmm_page_fault_h2d_sync(struct devmm_devid svm_id, struct page **pages, unsigned long va, u32 adjust_order,
+                              const struct devmm_svm_heap *heap)
+{
+    struct devmm_chan_page_fault *fault_msg = NULL;
+    struct devmm_chan_phy_block *blks = NULL;
+    struct device *dev = NULL;
+    u32 j, idx;
+    int ret;
+
+    devmm_drv_debug("Page fault synchronize details. (dev_id=%u; va=0x%lx; "
+                    "adjust_order=%u)\n", svm_id.devid, va, adjust_order);
+
+    fault_msg = (struct devmm_chan_page_fault *)kzalloc(sizeof(struct devmm_chan_page_fault), GFP_KERNEL);
+    if (fault_msg == NULL) {
+        devmm_drv_err("Kzalloc error. (dev_id=%u; va=0x%lx; adjust_order=%u)\n", svm_id.devid, va, adjust_order);
+        return -ENOMEM;
+    }
+    blks = fault_msg->blks;
+    devmm_fill_page_fault_msg(svm_id, va, adjust_order, DEVMM_CHAN_PAGE_FAULT_H2D_ID, fault_msg);
+
+    dev = devmm_devid_to_device(svm_id.devid);
+    if (dev == NULL) {
+        devmm_drv_err("Device is NULL. (dev_id=%d)\n", svm_id.devid);
+        kfree(fault_msg);
+        return -ENODEV;
+    }
+
+    if (fault_msg->num > DEVMM_PAGE_NUM_PER_FAULT) {
+        devmm_drv_err("Fault message num is invalid. (fault_msg->num=%u)\n", fault_msg->num);
+        kfree(fault_msg);
+        return -EINVAL;
+    }
+    for (idx = 0, j = 0; idx < fault_msg->num; idx++) {
+        blks[idx].pa = page_to_phys(pages[idx]);
+        blks[idx].sz = PAGE_SIZE;
+        devmm_merg_phy_blk(blks, idx, &j);
+    }
+    fault_msg->num = j;
+
+    for (idx = 0; idx < fault_msg->num; idx++) {
+        blks[idx].pa = dma_map_page(dev, pfn_to_page(PFN_DOWN(blks[idx].pa)), 0, blks[idx].sz, DMA_BIDIRECTIONAL);
+        if (dma_mapping_error(dev, blks[idx].pa)) {
+            devmm_drv_err("Host page fault dma map page failed. (dev_id=%u; va=0x%lx; adjust_order=%u)\n",
+                          svm_id.devid, va, adjust_order);
+            ret = -EIO;
+            goto host_page_fault_dma_free;
+        }
+    }
+	/*将主机端的物理地址虚拟地址以及申请的内存大小等信息全部发送给device*/
+    /* sync send msg:device todo copy data process */
+    ret = devmm_chan_msg_send(fault_msg, sizeof(*fault_msg), 0);
+    if (ret) {
+        devmm_drv_err("Host page fault send message failed. (ret=%d; dev_id=%u; va=0x%lx; adjust_order=%u)\n",
+                      ret, svm_id.devid, va, adjust_order);
+    }
+
+host_page_fault_dma_free:
+    for (j = 0; j < idx; j++) {
+        dma_unmap_page(dev, blks[j].pa, blks[j].sz, DMA_BIDIRECTIONAL);
+    }
+    kfree(fault_msg);
+    fault_msg = NULL;
+    return ret;
+}
+```
+
+猜想，device端的物理内存申请是device收到消息后进行的，因为跟踪源码没有发现前面有给device申请物理内存的地方，那根据推断整个主机端缺页中断中的处理流程为
+
+1.  主机端触发缺页中断&#x20;
+2.  主机端申请主机物理内存&#x20;
+3.  主机端发送页信息给设备&#x20;
+4.  设备端接受消息&#x20;
+5.  &#x20;设备端申请物理内存&#x20;
+6.  设备端将申请到的物理内存中的数据通过dma拷贝到主机端&#x20;
+7.  设备端记录虚拟地址以及物理地址
+8.  设备端将虚拟地址加入页表中，之后设备若访问这个虚拟地址也会产生缺页中断
+9.  设备端将设备端发送消息给主机端通知迁移完成&#x20;
+10. 主机端收到消息&#x20;
+11. 主机端建立虚拟内存物理内存的映射
+
+注意注释中的第六点device inv device page,return.当设备端接收到主机端的缺页中断发送过来的消息后，设备端需要解除自己对这块儿虚拟地址建立的映射以避免一致性问题，虽然我们没有设备端的代码，但是可以通过主机端接收设备端缺页中断处理消息的流程来验证我们的猜想。
+
+主机端接收到pcie消息后会通过以下调用函数调用路径来处理。
+
+```c
+devmm_host_chan_msg_recv()
+    devmm_chan_msg_dispatch()
+        devmm_chan_page_fault_d2h_process()
+             
+```
+
+函数 devmm\_chan\_page\_fault\_d2h\_process()会将主机端的页迁移到设备端，之后解除主机端的映射
+
+```c
+STATIC int devmm_chan_page_fault_d2h_process(struct devmm_svm_process *svm_process, struct devmm_svm_heap *heap,
+    void *msg, u32 *ack_len)
+{
+    struct devmm_chan_page_fault *fault_msg = (struct devmm_chan_page_fault *)msg;
+    struct devmm_svm_process_id *process_id = &fault_msg->head.process_id;
+    ret = devmm_chan_page_fault_d2h_process_copy(fault_msg, svm_process, heap);
+    ret = devmm_unmap_pages(svm_process, fault_msg->va, adjust_order);
+    return 0;
+}
+```
+
+其中函数devmm\_chan\_page\_fault\_d2h\_process\_copy完成了页迁移
+
+```c
+STATIC int devmm_chan_page_fault_d2h_process_copy(struct devmm_chan_page_fault *fault_msg,
+                                                  struct devmm_svm_process *svm_process, struct devmm_svm_heap *heap)
+{
+    /*根据收到的消息中的虚拟地址获得vma*/
+    vma = devmm_find_vma(svm_process, fault_msg->va);
+    /*得到物理地址*/
+    ret = devmm_va_to_palist(vma, fault_msg->va, heap->chunk_page_size, pas, &num);
+    /*调用dma_map_page准备dma传输*/
+    devmm_merg_pa_by_num(pas, num, PAGE_SIZE, szs, &num);
+    for (i = 0; i < num; i++) {
+        pages[i] = pfn_to_page(PFN_DOWN(pas[i]));
+        devmm_pin_page(pages[i]);
+        pas[i] = dma_map_page(dev, pages[i], 0, szs[i], DMA_BIDIRECTIONAL);
+    }
+    /*dma传输，并向device回复消息*/
+    ret = devmm_chan_page_fault_d2h_process_dma_copy(fault_msg, pas, szs, num);
+page_fault_d2h_copy_dma_free:
+    for (j = 0; j < i; j++) {
+        devmm_put_page(pages[j], svm_process);
+        dma_unmap_page(dev, pas[j], szs[j], DMA_BIDIRECTIONAL);
+    }
+page_fault_d2h_copy_free_pas:
+    kfree(pas);
+    pas = NULL;
+    return ret;
+}
+```
+
+函数devmm\_chan\_page\_fault\_d2h\_process\_dma\_copy的注释详细描述了整个设备端缺页的流程，函数本身主要是实现了dma拷贝。
+
+```c
+/* d2h fault, inv host pagetable:
+ * 1. device query device page
+ * 2. device send page-msg to host
+ * 3. host recv and prs devic pages
+ * 4. host query host page (pin page and map dma)
+ * 5. host copy to device
+ * 6. host inv host page (unpin page and unmap dma), return.
+ * 7. device if nonfull size return to 1.
+ */
+int devmm_chan_page_fault_d2h_process_dma_copy(struct devmm_chan_page_fault *fault_msg, unsigned long *pas,
+    u32 *szs, unsigned int num)
+{
+    struct devmm_svm_process_id *process_id = &fault_msg->head.process_id;
+    struct devdrv_dma_node *dma_nodes = NULL;
+    u32 off, max_num, i;
+    int ret;
+
+    dma_nodes = (struct devdrv_dma_node *)kzalloc(sizeof(struct devdrv_dma_node) * DEVMM_PAGE_NUM_PER_FAULT,
+                                                  GFP_KERNEL)
+    /*
+		code..........
+		填充dma属性，包括源地址，目标地址，长度等信息
+	*/
+	
+	/*进行拷贝*/
+    ret = devmm_dma_sync_link_copy(fault_msg->head.dev_id, fault_msg->head.vfid, dma_nodes, max_num);
+    if (ret) {
+        devmm_drv_err("Dma sync link copy failed. (hostpid=%d; devid=%u; vfid=%u; va=0x%llx; num=%d; ret=%d)\n",
+            process_id->hostpid, process_id->devid, process_id->vfid, fault_msg->va,
+            fault_msg->num, ret);
+    }
+
+    kfree(dma_nodes);
+    dma_nodes = NULL;
+
+    return ret;
+}
+```
+
+现在回到函数devmm\_chan\_page\_fault\_d2h\_process中，主机端完成页面迁移后(向设备端拷贝)，会解除主机端的虚拟地址物理地址映射，避免产生一致性问题。代码实现如下
+
+```c
+/*
+devmm_unmap_pages()
+	->devmm_unmap_page_from_vma()
+		->devmm_unmap_phy_pages()
+*/
+STATIC void devmm_unmap_phy_pages(struct vm_area_struct *vma, unsigned long vaddr, unsigned long paddr,
+    struct devmm_svm_process *svm_proc)
+{
+    struct page *tem_page = pfn_to_page(PFN_DOWN(paddr));
+
+    devmm_zap_vma_ptes(vma, vaddr, PAGE_SIZE);
+    devmm_put_page(tem_page, svm_proc);
+}		
+
+/*linux内核提供的解除PTE映射的函数*/
+void devmm_zap_vma_ptes(struct vm_area_struct *vma, unsigned long vaddr, unsigned long size)
+{
+    zap_vma_ptes(vma, vaddr, size);
+}
+
+/*之前使用get_page锁存了页面，需要调用这个函数减少页的引用计数*/
+void devmm_put_page(struct page *tem_page, struct devmm_svm_process *svm_process)
+{
+	/* code.............. */
+}	
+```
+
+猜想，根据代码分析以及注释内容，当设备端的kernel核函数去访问主机为他申请的虚拟地址时，其经过的流程为
+
+1.  设备端触发缺页中断
+2.  设备端找到之前存储的与虚拟内存对应的物理内存
+3.  设备端发送页信息给主机端
+4.  主机端接受消息
+5.  主机端根据接收到的消息中存的虚拟内存找到自己对应的物理内存
+6.  主机端将自己物理内存中的信息通过dma拷贝到设备端的物理内存(设备端的物理内存通过解析PCIE消息获取)
+7.  主机端解除自己的页映射
+8.  主机端解除锁页
+
+## 总结
+
+本文通过cuda um的定义，以及Ascend中的源码分析大致总结了UM的具体实现方式，作者本身的代码功底比较薄弱，若有错误之处请多多指导。
