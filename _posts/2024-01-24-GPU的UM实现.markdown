@@ -1,4 +1,30 @@
+# GPU的UM实现
 
+
+
+## UM统一内存
+
+在CUDA中，UM提供了单一指针托管内存，由系统自动进行内存迁移的方式。其具体表现形式为，在不支持UM的CUDA编程中，CUDA程序申请设备内存后需要手动使用cudaMemcpy函数将主机数据拷贝至设备或将设备数据拷贝至主机。支持UM后，主机可以直接访问设备端的指针，并在缺页中断中将设备地址对应的页迁移到主机端。设备在之后访问设备端的指针时可以在设备端的缺页中断中将主机对应的页迁移到设备端。这听起来有些拗口。在英伟达提供的open-gpu-kernel-modules源码中，虽然我很希望可以找到关于这块儿的具体实现，但是缺页中断的具体处理似乎被隐藏了。当然以下代码是我根据常规经验推理的UM的执行流程，因为没有具体在GPU上验证过，其准确性有待商榷。
+
+```c
+
+static struct vm_operations_struct uvm_vm_ops_managed =
+{
+    .open         = uvm_vm_open_managed_entry,
+    .close        = uvm_vm_close_managed_entry,
+
+#if defined(NV_VM_OPS_FAULT_REMOVED_VMA_ARG)
+    .fault        = uvm_vm_fault_wrapper_entry,
+    .page_mkwrite = uvm_vm_fault_wrapper_entry,
+#else
+    .fault        = uvm_vm_fault_entry,
+    .page_mkwrite = uvm_vm_fault_entry,
+#endif
+};
+
+/*
+ uvm_vm_fault_entry->uvm_vm_fault->uvm_va_space_cpu_fault_managed->uvm_va_space_cpu_fault->
+*/
 static NV_STATUS uvm_hmm_migrate_begin(uvm_va_block_t *va_block)
 {
     return NV_OK;
